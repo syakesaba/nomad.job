@@ -1,0 +1,63 @@
+# Change variables
+variables {
+    domain = "oracle.example.com"
+}
+
+job "nginx.job" {
+    datacenters = ["dc1"]
+    group "nginx.group" {
+        count = 2
+        spread {
+            attribute = "${node.unique.id}"
+        }
+        network {
+            port "http" {
+                to = 8888
+            }
+        }
+        service {
+            name = "nginx"
+            port = "http"
+        }
+
+        task "nginx.server" {
+            resources {
+                cpu = 256
+                memory = 128
+            }
+            driver = "docker"
+            config {
+                image = "nginx"
+                ports = ["http"]
+                volumes = [
+                    "local/conf.d:/etc/nginx/conf.d",
+                    "local/html:/usr/share/nginx/html"
+                ]
+            }
+            template {
+                destination = "local/conf.d/${ var.domain }.index.conf"
+                data = <<EOH
+server {
+    listen       8888;
+    server_name  ${ var.domain };
+    location / {
+        root   /usr/share/nginx/html;
+        index  index.html index.htm;
+    }
+}
+EOH
+            }
+            env {
+                dc = "${NOMAD_DC}"
+                region = "${NOMAD_REGION}"
+                allocation = "${NOMAD_ALLOC_NAME}(${NOMAD_ALLOC_ID} #${NOMAD_ALLOC_INDEX})"
+            }
+            template {
+                destination = "local/html/index.html"
+                data = <<EOH
+<body><pre>Hello World from {{ env "allocation" }} at {{ env "region" }}, {{ env "dc" }}</pre></body>
+EOH
+            }
+        }
+    }
+}

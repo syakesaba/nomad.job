@@ -1,0 +1,106 @@
+# Change variables
+variables {
+    domain = "oracle.example.com"
+    ip1 = "0.0.0.1"
+    ip2 = "0.0.0.2"
+}
+
+job "knotdns.job" {
+    datacenters = ["dc1"]
+    group "knotdns.group" {
+        count=2
+        spread {
+            attribute = "${node.unique.id}"
+        }
+        network {
+            port "domain" {
+                static = 53
+            }
+        }
+        task "knotdns.server" {
+            resources {
+                cpu = 256
+                memory = 128
+            }
+            driver = "docker"
+
+            template {
+                destination = "local/knot.conf"
+                data = <<EOH
+
+server:
+  rundir: "/rundir"
+  user: knot:knot
+  automatic-acl: off # NO NOTIFY
+  answer-rotation: on # DNS-ROUND-ROBIN
+  listen: [ 0.0.0.0@53 ]
+
+log:
+  - target: stdout
+    any: debug
+
+database:
+  storage: "/storage"
+
+mod-cookies:
+  - id: default
+    secret-lifetime: 30h # The Server Secret is regenerated every 30 hours
+    badcookie-slip: 3    # The server replies only to every third query with a wrong cookie
+
+mod-rrl:
+  - id: default
+    rate-limit: 200   # Allow 200 resp/s for each flow
+    slip: 2           # Approximately every other response slips
+
+template:
+  - id: default
+    storage: "/config"
+    file: "%s.zone"
+    global-module: mod-cookies/default
+    global-module: mod-rrl/default
+
+zone:
+  - domain: ${ var.domain }
+EOH
+            }
+
+            template {
+                destination = "local/${ var.domain }.zone"
+                data = <<EOH
+$ORIGIN ${ var.domain }.
+$TTL 3600
+@       SOA     ns1.${ var.domain }. hostmaster.${ var.domain }. (
+                2010111213      ; serial
+                6h              ; refresh
+                1h              ; retry
+                1w              ; expire
+                1d )            ; minimum
+
+        NS      ns1
+        NS      ns2
+        A       ${ var.ip1 }
+        A       ${ var.ip2 }
+
+ns1     A       ${ var.ip1 }
+ns1     A       ${ var.ip2 }
+ns2     A       ${ var.ip1 }
+ns2     A       ${ var.ip2 }
+a       A       ${ var.ip1 }
+b       A       ${ var.ip2 }
+EOH
+            }
+
+            config {
+                image = "cznic/knot"
+                ports = ["domain"]
+                args = [
+                    "knotd",
+                    "-v",
+                    "-c",
+                    "/config/knot.conf",
+                ]
+                volumes = ["local/knot.conf:/config/knot.conf","local/${ var.domain }.zone:/config/${ var.domain }.zone"]
+            }
+        }
+    }
+}

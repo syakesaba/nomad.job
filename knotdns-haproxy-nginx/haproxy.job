@@ -1,0 +1,74 @@
+# Change variables
+variables {
+    http_srv = "nginx"
+}
+
+job "haproxy.job" {
+    datacenters = ["dc1"]
+    group "haproxy.group" {
+        count = 2
+        spread {
+            attribute = "${node.unique.id}"
+        }
+        network {
+            port "http" {
+                static = 80
+            }
+            port "haproxy_ui" {
+                static = 8080
+            }
+        }
+        task "haproxy.server" {
+            resources {
+                cpu = 256
+                memory = 128
+            }
+            user = "root"
+            driver = "docker"
+            config {
+                image        = "haproxy"
+                network_mode = "host"
+                volumes = [
+                    "local/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg",
+                ]
+            }
+            template {
+                destination = "local/haproxy.cfg"
+                data = <<EOH
+
+global
+    #stats socket /var/run/api.sock user root group root mode 660 level admin expose-fd listeners
+    stats socket /var/run/api.sock user haproxy group haproxy mode 660 level admin expose-fd listeners
+    log stdout format raw local0 info
+    maxconn 16384
+
+defaults
+    mode http
+    timeout connect 10000 # default 10 second time out if a backend is not found
+    timeout client 300000 # 5 min timeout for client
+    timeout server 300000 # 5 min timeout for server
+
+frontend stats
+    bind *:8080
+    stats uri /
+    stats show-legends
+    no log
+
+frontend http_frontend
+    bind *:80
+    default_backend http_backend
+
+backend http_backend
+    balance roundrobin
+    server-template nginx 2 _${ var.http_srv }._tcp.service.consul:8888 resolvers consul resolve-opts allow-dup-ip resolve-prefer ipv4 check
+
+resolvers consul
+    nameserver consul 127.0.0.1:8600
+    accepted_payload_size 8192
+    hold valid 5s
+
+EOH
+            }
+        }
+    }
+}

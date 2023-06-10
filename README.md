@@ -1,2 +1,1 @@
-# nomad.job
-my nomad job hcl file 
+https://zenn.dev/syakesaba/articles/use-oci-always-free-micro
