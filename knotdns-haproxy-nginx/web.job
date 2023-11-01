@@ -1,0 +1,240 @@
+# Change variables
+variables {
+    domain = "nomad.example.com"
+    ip1 = "a.b.c.d"
+    ip2 = "e.f.g.h"
+    http_srv = "nginx"
+    acme = "acme"
+}
+
+job "web.job" {
+    datacenters = ["dc1"]
+    group "knotdns.group" {
+        count = 2
+        spread {
+            attribute = "${node.unique.id}"
+        }
+        network {
+            port "domain" {
+                static = 53
+            }
+        }
+        task "knotdns.server" {
+            resources {
+                # cpu = 256
+                memory = 128
+            }
+            driver = "docker"
+
+            template {
+                destination = "local/knot.conf"
+                data = <<EOH
+
+server:
+  rundir: "/rundir"
+  # user: knot:knot
+  user: root:root
+  automatic-acl: off # NO NOTIFY
+  answer-rotation: on # DNS-ROUND-ROBIN
+  listen: [ 0.0.0.0@53 ]
+
+log:
+  - target: stdout
+    any: debug
+
+database:
+  storage: "/storage"
+
+mod-cookies:
+  - id: default
+    secret-lifetime: 30h # The Server Secret is regenerated every 30 hours
+    badcookie-slip: 3    # The server replies only to every third query with a wrong cookie
+
+mod-rrl:
+  - id: default
+    rate-limit: 200   # Allow 200 resp/s for each flow
+    slip: 2           # Approximately every other response slips
+
+template:
+  - id: default
+    storage: "/config"
+    file: "%s.zone"
+    global-module: mod-cookies/default
+    global-module: mod-rrl/default
+# hmac-sha256:acme: ${ var.acme }
+key:
+  - id: acme
+    algorithm: hmac-sha256
+    secret: ${ var.acme }
+acl:
+  - id: acme
+    key: acme
+    action: update
+zone:
+  - domain: ${ var.domain }
+    acl: acme
+    file: "%s.zone"
+EOH
+            }
+
+            template {
+                destination = "local/${ var.domain }.zone"
+                data = <<EOH
+$ORIGIN ${ var.domain }.
+$TTL 3600
+@       SOA     ns1.${ var.domain }. hostmaster.${ var.domain }. (
+                2010111213      ; serial
+                6h              ; refresh
+                1h              ; retry
+                1w              ; expire
+                1d )            ; minimum
+
+        NS      ns1
+        NS      ns2
+        A       ${ var.ip1 }
+        A       ${ var.ip2 }
+
+ns1     A       ${ var.ip1 }
+ns1     A       ${ var.ip2 }
+ns2     A       ${ var.ip1 }
+ns2     A       ${ var.ip2 }
+a       A       ${ var.ip1 }
+b       A       ${ var.ip2 }
+EOH
+            }
+
+            config {
+                image = "cznic/knot"
+                ports = ["domain"]
+                args = [
+                    "knotd",
+                    "-v",
+                    "-c",
+                    "/config/knot.conf",
+                ]
+                volumes = ["local/knot.conf:/config/knot.conf","local/${ var.domain }.zone:/config/${ var.domain }.zone"]
+            }
+        }
+    }
+    group "haproxy.group" {
+        count = 2
+        spread {
+            attribute = "${node.unique.id}"
+        }
+        network {
+            port "http" {
+                static = 80
+            }
+            port "haproxy_ui" {
+                static = 8080
+            }
+        }
+        task "haproxy.server" {
+            resources {
+                # cpu = 256
+                memory = 128
+            }
+            user = "root"
+            driver = "docker"
+            config {
+                image        = "haproxy"
+                network_mode = "host"
+                volumes = [
+                    "local/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg",
+                ]
+            }
+            template {
+                destination = "local/haproxy.cfg"
+                data = <<EOH
+
+global
+    #stats socket /var/run/api.sock user root group root mode 660 level admin expose-fd listeners
+    stats socket /var/run/api.sock user haproxy group haproxy mode 660 level admin expose-fd listeners
+    log stdout format raw local0 info
+    maxconn 16384
+
+defaults
+    mode http
+    timeout connect 10000 # default 10 second time out if a backend is not found
+    timeout client 300000 # 5 min timeout for client
+    timeout server 300000 # 5 min timeout for server
+
+frontend stats
+    bind *:8080
+    stats uri /
+    stats show-legends
+    no log
+
+frontend http_frontend
+    bind *:80
+    default_backend http_backend
+
+backend http_backend
+    balance roundrobin
+    server-template nginx 2 _${ var.http_srv }._tcp.service.consul:8888 resolvers consul resolve-opts allow-dup-ip resolve-prefer ipv4 check
+
+resolvers consul
+    nameserver consul 127.0.0.1:8600
+    accepted_payload_size 8192
+    hold valid 5s
+
+EOH
+            }
+        }
+    }
+    group "nginx.group" {
+        count = 2
+        spread {
+            attribute = "${node.unique.id}"
+        }
+        network {
+            port "http" {
+                to = 8888
+            }
+        }
+        service {
+            name = "nginx"
+            port = "http"
+        }
+
+        task "nginx.server" {
+            resources {
+                # cpu = 256
+                memory = 128
+            }
+            driver = "docker"
+            config {
+                image = "nginx"
+                ports = ["http"]
+                volumes = [
+                    "local/conf.d:/etc/nginx/conf.d",
+                    "local/html:/usr/share/nginx/html"
+                ]
+            }
+            template {
+                destination = "local/conf.d/${ var.domain }.index.conf"
+                data = <<EOH
+server {
+    listen       8888;
+    server_name  ${ var.domain };
+    location / {
+        root   /usr/share/nginx/html;
+        index  index.html index.htm;
+    }
+}
+EOH
+            }
+            env {
+                dc = "${NOMAD_DC}"
+                region = "${NOMAD_REGION}"
+                allocation = "${NOMAD_ALLOC_NAME}(${NOMAD_ALLOC_ID} #${NOMAD_ALLOC_INDEX})"
+            }
+            template {
+                destination = "local/html/index.html"
+                data = <<EOH
+<body><pre>Hello World from {{ env "allocation" }} at {{ env "region" }}, {{ env "dc" }}</pre></body>
+EOH
+            }
+        }
+    }
+}
